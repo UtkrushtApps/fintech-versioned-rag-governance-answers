@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import logging
 import uuid
 
@@ -13,24 +12,20 @@ from app.generation import Generator, LLMNotConfigured
 from app.graph_expansion import GraphExpander
 from app.graph_repository import GraphRepository
 from app.hybrid_retrieval import HybridRetriever
-from app.models import AnswerRequest, AnswerResponse
+from app.knowledge import KnowledgeResolver
+from app.models import AnswerRequest, AnswerResponse, ProvenanceRecord
 
 logger = logging.getLogger(__name__)
 app = FastAPI(title='Fintech Disclosure Advisor')
 
 repo = GraphRepository()
+resolver = KnowledgeResolver(repo)
 retriever = HybridRetriever()
 expander = GraphExpander()
 assembler = ContextAssembler()
 generator = Generator()
 audit = AuditLogger()
 cache = RetrievalCache()
-
-
-def context_fingerprint(context) -> str:
-    # Include the signed snapshot to prevent cache leakage when the underlying application record changes.
-    raw = f"{context.application_id}|{context.product_id}|{context.jurisdiction}|{context.signed_at.isoformat()}"
-    return hashlib.sha256(raw.encode('utf-8')).hexdigest()
 
 
 @app.get('/health')
@@ -43,76 +38,74 @@ def answer(request: AnswerRequest) -> AnswerResponse:
     request_id = str(uuid.uuid4())
     try:
         context = repo.load_application(request.application_id)
-        ctx_fp = context_fingerprint(context)
+        knowledge = resolver.resolve(context)
+        fingerprint = knowledge.fingerprint()
 
-        cached = cache.get(application_id=request.application_id, question=request.question, context_fingerprint=ctx_fp)
+        cached = cache.get(request.application_id, request.question, fingerprint)
         if cached and cached.get('answer'):
-            # Cached responses still include provenance/citations from prior generation.
             return AnswerResponse(**cached)
 
-        candidates = retriever.retrieve(request.question, context)
-        graph = expander.expand(context, candidates)
+        conflict_warnings = [f'{c.kind}: {c.detail} (sources: {", ".join(c.sources)})'
+                             for c in knowledge.conflicts]
 
+        # A product the bank never offered in this state has no answer, however close
+        # the surviving disclosure text reads. Decline, and say what was checked.
+        if not knowledge.offered:
+            graph = expander.expand(context, [], knowledge)
+            response = AnswerResponse(
+                request_id=request_id,
+                answer=(
+                    f'No disclosure applies to {request.application_id}: '
+                    f'{knowledge.offering_note} The bank\'s records hold no {context.product_id} '
+                    f'disclosure in force for a {context.jurisdiction} borrower, so this question '
+                    f'cannot be answered from them. Refer the application for review.'
+                ),
+                citations=[],
+                provenance=ProvenanceRecord(
+                    request_id=request_id,
+                    application_id=request.application_id,
+                    index_id=generator.settings.index_id,
+                    chunk_ids=[],
+                    graph_refs=[node.node_id for node in graph.nodes],
+                    revision_ids=[],
+                    manifest_refs=[generator.settings.index_id],
+                ),
+                warnings=['declined: no offering on record'] + conflict_warnings,
+            )
+            audit.record_retrieval(request_id, request.application_id, request.question, [], [], graph)
+            cache.set(request.application_id, request.question, fingerprint, response.model_dump(mode='json'))
+            return response
+
+        candidates = retriever.retrieve(request.question, context, knowledge)
+        missing = retriever.coverage(candidates, knowledge)
+        graph = expander.expand(context, candidates, knowledge)
         evidence_text, citations, provenance = assembler.assemble(
-            request_id=request_id,
-            application_id=request.application_id,
-            chunks=candidates,
-            graph=graph,
+            request_id, request.application_id, candidates, graph
         )
+        audit.record_retrieval(request_id, request.application_id, request.question,
+                               candidates, candidates, graph)
 
-        audit.record_retrieval(
-            request_id=request_id,
-            application_id=request.application_id,
-            query_text=request.question,
-            candidates=candidates,
-            selected=candidates[:4],
-            graph=graph,
-        )
+        warnings = list(conflict_warnings)
+        if missing:
+            warnings.append('incomplete evidence: no passage from ' + ', '.join(sorted(missing)))
 
-        prompt = generator.build_prompt(request, context, evidence_text, citations)
+        prompt = generator.build_prompt(request, context, evidence_text, citations,
+                                        knowledge=knowledge, missing_roles=missing)
         answer_text = generator.generate(prompt)
-
-        warnings: list[str] = []
-        expected_citation_ids = {c.citation_id for c in citations}
-        found_citation_ids = generator.extract_citation_ids(answer_text)
-        if expected_citation_ids and not (expected_citation_ids & found_citation_ids):
-            warnings.append('Answer did not include any expected citation identifiers (C1/C2/...).')
-        if citations and len(found_citation_ids) == 1 and len(expected_citation_ids) > 1:
-            warnings.append('Answer cited fewer evidence identifiers than available; verify completeness.')
-
-        response = AnswerResponse(
-            request_id=request_id,
-            answer=answer_text,
-            citations=citations,
-            provenance=provenance,
-            warnings=warnings,
-        )
-
-        provider_model = (
-            generator.settings.anthropic_model
-            if generator.settings.llm_provider.lower().strip() == 'anthropic'
-            else generator.settings.openai_model
-        )
-
+        response = AnswerResponse(request_id=request_id, answer=answer_text, citations=citations,
+                                  provenance=provenance, warnings=warnings)
         audit.record_generation(
-            request_id=request_id,
-            application_id=request.application_id,
-            provider=generator.settings.llm_provider,
-            model_name=provider_model,
-            prompt=prompt,
-            answer=answer_text,
-            citations=citations,
-            provenance=provenance,
+            request_id,
+            request.application_id,
+            generator.settings.llm_provider,
+            generator.settings.anthropic_model if generator.settings.llm_provider == 'anthropic' else generator.settings.openai_model,
+            prompt,
+            answer_text,
+            citations,
+            provenance,
         )
-
-        cache.set(
-            application_id=request.application_id,
-            question=request.question,
-            context_fingerprint=ctx_fp,
-            payload=response.model_dump(mode='json'),
-        )
+        cache.set(request.application_id, request.question, fingerprint, response.model_dump(mode='json'))
         return response
-
     except LLMNotConfigured as exc:
         raise HTTPException(status_code=424, detail=str(exc)) from exc
     except ValueError as exc:
