@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from datetime import datetime
 from typing import Any, Iterator
 
 import psycopg
@@ -36,156 +35,65 @@ class GraphRepository:
             raise ValueError(f'Unknown application_id: {application_id}')
         return ApplicationContext(**row)
 
-    def product_node(self, product_id: str, signed_at: datetime | None = None) -> dict[str, Any] | None:
-        # Optional time scoping prevents leakage across product lifecycle validity windows.
-        with get_conn() as conn:
-            if signed_at is None:
-                return conn.execute(
-                    """
-                    SELECT n.*
-                    FROM entity_crosswalks x
-                    JOIN graph_nodes n ON n.node_id = x.node_id
-                    WHERE x.source_system = 'postgres.products' AND x.source_key = %s
-                    ORDER BY x.confidence DESC, n.node_id
-                    LIMIT 1
-                    """,
-                    (product_id,),
-                ).fetchone()
-
-            return conn.execute(
-                """
-                SELECT n.*
-                FROM entity_crosswalks x
-                JOIN graph_nodes n ON n.node_id = x.node_id
-                WHERE x.source_system = 'postgres.products'
-                  AND x.source_key = %s
-                  AND (x.valid_from IS NULL OR x.valid_from <= %s)
-                  AND (x.valid_to IS NULL OR x.valid_to > %s)
-                  AND (n.valid_from IS NULL OR n.valid_from <= %s)
-                  AND (n.valid_to IS NULL OR n.valid_to > %s)
-                ORDER BY x.confidence DESC, n.node_id
-                LIMIT 1
-                """,
-                (product_id, signed_at, signed_at, signed_at, signed_at),
-            ).fetchone()
-
-    def revision_node(self, revision_id: str, signed_at: datetime | None = None) -> dict[str, Any] | None:
-        # Revision nodes are typically unique; time scoping avoids stray archived periods.
-        with get_conn() as conn:
-            if signed_at is None:
-                return conn.execute(
-                    """
-                    SELECT n.*
-                    FROM entity_crosswalks x
-                    JOIN graph_nodes n ON n.node_id = x.node_id
-                    WHERE x.source_system = 'postgres.document_revisions' AND x.source_key = %s
-                    ORDER BY x.confidence DESC, n.node_id
-                    LIMIT 1
-                    """,
-                    (revision_id,),
-                ).fetchone()
-
-            return conn.execute(
-                """
-                SELECT n.*
-                FROM entity_crosswalks x
-                JOIN graph_nodes n ON n.node_id = x.node_id
-                WHERE x.source_system = 'postgres.document_revisions'
-                  AND x.source_key = %s
-                  AND (x.valid_from IS NULL OR x.valid_from <= %s)
-                  AND (x.valid_to IS NULL OR x.valid_to > %s)
-                  AND (n.valid_from IS NULL OR n.valid_from <= %s)
-                  AND (n.valid_to IS NULL OR n.valid_to > %s)
-                ORDER BY x.confidence DESC, n.node_id
-                LIMIT 1
-                """,
-                (revision_id, signed_at, signed_at, signed_at, signed_at),
-            ).fetchone()
-
-    def disclosure_revisions_for_context(
-        self,
-        *,
-        product_id: str,
-        jurisdiction: str,
-        signed_at: datetime,
-        limit: int = 5,
-    ) -> list[dict[str, Any]]:
-        # Versioned disclosure revisions authorized at signing.
+    def product_nodes(self, product_id: str) -> list[dict[str, Any]]:
+        """Every product node the key maps to. More than one means the records disagree."""
         with get_conn() as conn:
             return list(
                 conn.execute(
                     """
-                    SELECT r.revision_id, r.document_id, r.revision_label, r.effective_at,
-                           r.superseded_at, r.lifecycle_state, r.source_uri
-                    FROM document_revisions r
-                    JOIN source_documents d ON d.document_id = r.document_id
-                    WHERE d.product_id = %s
-                      AND d.jurisdiction = %s
-                      AND r.effective_at <= %s
-                      AND (r.superseded_at IS NULL OR r.superseded_at > %s)
-                    ORDER BY r.effective_at DESC, r.published_at DESC, r.revision_id
-                    LIMIT %s
+                    SELECT n.*, x.confidence
+                    FROM entity_crosswalks x
+                    JOIN graph_nodes n ON n.node_id = x.node_id
+                    WHERE x.source_system = 'postgres.products' AND x.source_key = %s
+                    ORDER BY x.confidence DESC, n.node_id
                     """,
-                    (product_id, jurisdiction, signed_at, signed_at, limit),
+                    (product_id,),
                 )
             )
 
-    def disclosure_revision_for_context(
-        self,
-        *,
-        product_id: str,
-        jurisdiction: str,
-        signed_at: datetime,
-    ) -> dict[str, Any] | None:
-        revisions = self.disclosure_revisions_for_context(
-            product_id=product_id,
-            jurisdiction=jurisdiction,
-            signed_at=signed_at,
-            limit=1,
-        )
-        return revisions[0] if revisions else None
-
-    def disclosure_document_ids_for_context(
-        self,
-        *,
-        product_id: str,
-        jurisdiction: str,
-        signed_at: datetime,
-    ) -> list[str]:
+    def product_node(self, product_id: str) -> dict[str, Any] | None:
         with get_conn() as conn:
-            rows = conn.execute(
-                """
-                SELECT DISTINCT d.document_id
-                FROM source_documents d
-                JOIN document_revisions r ON r.document_id = d.document_id
-                WHERE d.product_id = %s
-                  AND d.jurisdiction = %s
-                  AND r.effective_at <= %s
-                  AND (r.superseded_at IS NULL OR r.superseded_at > %s)
-                """,
-                (product_id, jurisdiction, signed_at, signed_at),
-            ).fetchall()
-        return [row['document_id'] for row in rows]
-
-    def document_node_from_revision_node(self, revision_node_id: str) -> dict[str, Any] | None:
-        # Graph edge HAS_REVISION links DisclosureDocument -> DisclosureRevision.
-        with get_conn() as conn:
-            row = conn.execute(
+            return conn.execute(
                 """
                 SELECT n.*
-                FROM graph_edges e
-                JOIN graph_nodes n ON n.node_id = e.from_node_id
-                WHERE e.relationship_type = 'HAS_REVISION'
-                  AND e.to_node_id = %s
-                ORDER BY e.valid_from DESC NULLS LAST, e.edge_id
+                FROM entity_crosswalks x
+                JOIN graph_nodes n ON n.node_id = x.node_id
+                WHERE x.source_system = 'postgres.products' AND x.source_key = %s
+                ORDER BY x.confidence DESC, n.node_id
                 LIMIT 1
                 """,
-                (revision_node_id,),
+                (product_id,),
             ).fetchone()
-        # Prefer DisclosureDocument nodes.
-        if row and row.get('node_type') != 'DisclosureDocument':
-            return None
-        return row
+
+    def latest_disclosure_revision(self, product_id: str) -> dict[str, Any] | None:
+        with get_conn() as conn:
+            return conn.execute(
+                """
+                SELECT r.revision_id, r.document_id, r.revision_label, r.effective_at,
+                       r.superseded_at, r.lifecycle_state, r.source_uri,
+                       d.jurisdiction, d.product_id
+                FROM document_revisions r
+                JOIN source_documents d ON d.document_id = r.document_id
+                WHERE d.product_id = %s
+                ORDER BY r.effective_at DESC, r.published_at DESC, r.revision_id
+                LIMIT 1
+                """,
+                (product_id,),
+            ).fetchone()
+
+    def revision_node(self, revision_id: str) -> dict[str, Any] | None:
+        with get_conn() as conn:
+            return conn.execute(
+                """
+                SELECT n.*
+                FROM entity_crosswalks x
+                JOIN graph_nodes n ON n.node_id = x.node_id
+                WHERE x.source_system = 'postgres.document_revisions' AND x.source_key = %s
+                ORDER BY x.confidence DESC, n.node_id
+                LIMIT 1
+                """,
+                (revision_id,),
+            ).fetchone()
 
     def edges_for_nodes(self, node_ids: list[str]) -> list[dict[str, Any]]:
         if not node_ids:
@@ -204,43 +112,79 @@ class GraphRepository:
                 )
             )
 
+    def offerings_for(self, product_id: str) -> list[dict[str, Any]]:
+        with get_conn() as conn:
+            return list(
+                conn.execute(
+                    """
+                    SELECT offering_id, product_id, jurisdiction, offered_from, offered_to, offering_status
+                    FROM product_offerings
+                    WHERE product_id = %s
+                    ORDER BY jurisdiction, offered_from
+                    """,
+                    (product_id,),
+                )
+            )
+
+    def override_rules_for(self, document_id: str) -> list[dict[str, Any]]:
+        with get_conn() as conn:
+            return list(
+                conn.execute(
+                    """
+                    SELECT rule_id, base_document_id, addendum_document_id, jurisdiction, overrides_topics
+                    FROM override_rules
+                    WHERE base_document_id = %s
+                    ORDER BY jurisdiction
+                    """,
+                    (document_id,),
+                )
+            )
+
+    def documents_for(self, product_id: str) -> list[dict[str, Any]]:
+        with get_conn() as conn:
+            return list(
+                conn.execute(
+                    """
+                    SELECT document_id, document_type, title, jurisdiction, lifecycle_state
+                    FROM source_documents
+                    WHERE product_id = %s
+                    ORDER BY document_type, jurisdiction
+                    """,
+                    (product_id,),
+                )
+            )
+
+    def history_for(self, product_id: str) -> list[dict[str, Any]]:
+        with get_conn() as conn:
+            return list(
+                conn.execute(
+                    """
+                    SELECT history_id, predecessor_product_id, successor_product_id, change_type, changed_on, note
+                    FROM product_history
+                    WHERE predecessor_product_id = %s OR successor_product_id = %s
+                    ORDER BY changed_on
+                    """,
+                    (product_id, product_id),
+                )
+            )
+
+    def governance_for(self, subject_id: str) -> list[dict[str, Any]]:
+        with get_conn() as conn:
+            return list(
+                conn.execute(
+                    """
+                    SELECT governance_id, subject_type, subject_id, state_label, reason, starts_at, ends_at
+                    FROM governance_state
+                    WHERE subject_id = %s
+                    ORDER BY starts_at
+                    """,
+                    (subject_id,),
+                )
+            )
+
     def manifest(self, index_id: str) -> dict[str, Any] | None:
         with get_conn() as conn:
             return conn.execute(
                 "SELECT * FROM index_manifests WHERE index_id = %s",
                 (index_id,),
-            ).fetchone()
-
-    def provenance_for_revisions(self, revision_ids: list[str]) -> list[dict[str, Any]]:
-        if not revision_ids:
-            return []
-        with get_conn() as conn:
-            return list(
-                conn.execute(
-                    """
-                    SELECT dp.provenance_id, dp.revision_id, dp.upstream_system, dp.upstream_record_id,
-                           dp.collected_at, dp.lineage_hash, dp.notes
-                    FROM document_provenance dp
-                    WHERE dp.revision_id = ANY(%s)
-                    ORDER BY dp.revision_id, dp.collected_at
-                    """,
-                    (revision_ids,),
-                )
-            )
-
-    # Backwards-compatibility for older code paths (not used in hardened versioned retrieval).
-    def latest_disclosure_revision(self, product_id: str) -> dict[str, Any] | None:
-        with get_conn() as conn:
-            return conn.execute(
-                """
-                SELECT r.revision_id, r.document_id, r.revision_label, r.effective_at,
-                       r.superseded_at, r.lifecycle_state, r.source_uri,
-                       d.jurisdiction, d.product_id
-                FROM document_revisions r
-                JOIN source_documents d ON d.document_id = r.document_id
-                WHERE d.product_id = %s
-                ORDER BY r.effective_at DESC, r.published_at DESC, r.revision_id
-                LIMIT 1
-                """,
-                (product_id,),
             ).fetchone()
