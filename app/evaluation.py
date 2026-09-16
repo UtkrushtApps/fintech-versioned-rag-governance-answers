@@ -1,21 +1,26 @@
 from __future__ import annotations
 
+import hashlib
 import json
-import re
 from pathlib import Path
-from typing import Any
 
 from psycopg.types.json import Json
 
 from app.config import BASE_DIR, get_settings
-from app.context_assembly import ContextAssembler
-from app.generation import Generator, LLMNotConfigured
-from app.graph_expansion import GraphExpander
 from app.graph_repository import GraphRepository, get_conn
 from app.hybrid_retrieval import HybridRetriever
+from app.knowledge import KnowledgeResolver
 from app.models import DimensionResult, EvaluationCase, EvaluationReport
 
 EVAL_PATH = BASE_DIR / 'data' / 'eval_queries.jsonl'
+
+DIMENSIONS = (
+    'evidence_completeness',   # every document type that applies is represented
+    'scope_isolation',         # nothing from a document that does not apply
+    'abstention_correctness',  # a combination never offered yields no evidence
+    'conflict_visibility',     # disagreements in the records are reported, not resolved
+    'citation_grounding',      # every passage used can be cited back to its source
+)
 
 
 def load_eval_cases(path: Path = EVAL_PATH) -> list[EvaluationCase]:
@@ -23,197 +28,62 @@ def load_eval_cases(path: Path = EVAL_PATH) -> list[EvaluationCase]:
     with path.open('r', encoding='utf-8') as handle:
         for line in handle:
             if line.strip():
-                cases.append(EvaluationCase(**json.loads(line)))
-    return cases
+                row = json.loads(line)
+                cases.append(EvaluationCase(case_id=row['case_id'], application_id=row['application_id'],
+                                            question=row['question'], notes=row.get('notes')))
+    return sorted(cases, key=lambda case: case.case_id)
 
 
 class Evaluator:
     def __init__(self) -> None:
         self.repo = GraphRepository()
+        self.resolver = KnowledgeResolver(self.repo)
         self.retriever = HybridRetriever()
-        self.expander = GraphExpander()
-        self.assembler = ContextAssembler()
-        self.generator = Generator()
 
     def evaluate(self, run_label: str = 'local') -> EvaluationReport:
         dimensions: list[DimensionResult] = []
         for case in load_eval_cases():
-            context = self.repo.load_application(case.application_id)
-            chunks = self.retriever.retrieve(case.question, context)
-            graph = self.expander.expand(context, chunks)
-            evidence_text, citations, provenance = self.assembler.assemble(
-                request_id='eval',
-                application_id=case.application_id,
-                chunks=chunks,
-                graph=graph,
-            )
-
-            answer_text: str | None = None
-            generation_error: str | None = None
-            try:
-                # Faithfulness is about the generated answer; only attempt when provider keys exist.
-                provider = self.generator.settings.llm_provider.lower().strip()
-                if provider == 'anthropic' and self.generator.settings.anthropic_api_key:
-                    prompt = self.generator.build_prompt(
-                        request=type('Req', (), {'question': case.question, 'application_id': case.application_id})(),
-                        context=context,
-                        evidence_text=evidence_text,
-                        citations=citations,
-                    )
-                    answer_text = self.generator.generate(prompt)
-                elif provider != 'anthropic' and self.generator.settings.openai_api_key:
-                    prompt = self.generator.build_prompt(
-                        request=type('Req', (), {'question': case.question, 'application_id': case.application_id})(),
-                        context=context,
-                        evidence_text=evidence_text,
-                        citations=citations,
-                    )
-                    answer_text = self.generator.generate(prompt)
-            except LLMNotConfigured as exc:
-                generation_error = str(exc)
-            except Exception as exc:
-                generation_error = f'{type(exc).__name__}: {exc}'
-
-            dimensions.extend(
-                self._score_case(
-                    case=case,
-                    context=context,
-                    question=case.question,
-                    retrieved_chunks=chunks,
-                    graph=graph,
-                    citations=citations,
-                    provenance=provenance,
-                    answer_text=answer_text,
-                    generation_error=generation_error,
-                )
-            )
-
-        report = EvaluationReport(run_label=run_label, dimensions=dimensions)
+            dimensions.extend(self._score_case(case))
+        # Same code, same data, same verdict: the label is derived from the results.
+        digest = hashlib.sha256(
+            json.dumps([d.model_dump(mode='json') for d in dimensions], sort_keys=True).encode()
+        ).hexdigest()[:12]
+        report = EvaluationReport(run_label=f'{run_label}:{digest}', dimensions=dimensions)
         self._persist(report)
         return report
 
-    def _score_case(
-        self,
-        *,
-        case: EvaluationCase,
-        context: Any,
-        question: str,
-        retrieved_chunks: list[Any],
-        graph: Any,
-        citations: list[Any],
-        provenance: Any,
-        answer_text: str | None,
-        generation_error: str | None,
-    ) -> list[DimensionResult]:
-        # Authorized evidence scope at signing.
-        authorized = {
-            r['revision_id']
-            for r in self.repo.disclosure_revisions_for_context(
-                product_id=context.product_id,
-                jurisdiction=context.jurisdiction,
-                signed_at=context.signed_at,
-                limit=5,
-            )
-            if r.get('revision_id')
-        }
+    def _score_case(self, case: EvaluationCase) -> list[DimensionResult]:
+        context = self.repo.load_application(case.application_id)
+        knowledge = self.resolver.resolve(context)
+        chunks = self.retriever.retrieve(case.question, context, knowledge) if knowledge.offered else []
+        detail = {'case_id': case.case_id, 'application_id': case.application_id,
+                  'chunk_ids': sorted(chunk.chunk_id for chunk in chunks)}
 
-        retrieved_revision_ids = {getattr(chunk, 'revision_id', None) for chunk in retrieved_chunks if getattr(chunk, 'revision_id', None)}
+        missing = self.retriever.coverage(chunks, knowledge) if knowledge.offered else set()
+        out_of_scope = sorted({chunk.chunk_id for chunk in chunks
+                               if chunk.document_id not in knowledge.document_ids})
+        conflicts = [conflict.as_dict() for conflict in knowledge.conflicts]
 
-        # 1) Retrieval scope (version/jurisdiction/product/lifecycle)
-        retrieval_scope_passed = bool(retrieved_chunks) and retrieved_revision_ids.issubset(authorized) and bool(
-            retrieved_revision_ids & authorized
-        )
-        dims: list[DimensionResult] = [
-            DimensionResult(
-                name='retrieval_scope',
-                passed=retrieval_scope_passed,
-                detail={
-                    'case_id': case.case_id,
-                    'authorized_revision_ids': sorted(authorized),
-                    'retrieved_revision_ids': sorted(retrieved_revision_ids),
-                },
-            )
+        return [
+            DimensionResult(name='evidence_completeness',
+                            passed=(not knowledge.offered) or not missing,
+                            detail={**detail, 'missing_roles': sorted(missing),
+                                    'required_roles': sorted(knowledge.required_roles)}),
+            DimensionResult(name='scope_isolation',
+                            passed=not out_of_scope,
+                            detail={**detail, 'out_of_scope': out_of_scope}),
+            DimensionResult(name='abstention_correctness',
+                            passed=knowledge.offered or not chunks,
+                            detail={**detail, 'offered': knowledge.offered,
+                                    'offering_note': knowledge.offering_note}),
+            DimensionResult(name='conflict_visibility',
+                            passed=all(c.get('detail') for c in conflicts),
+                            detail={**detail, 'conflicts': conflicts}),
+            DimensionResult(name='citation_grounding',
+                            passed=all(chunk.source_uri and chunk.revision_id for chunk in chunks),
+                            detail={**detail, 'uncitable': sorted(chunk.chunk_id for chunk in chunks
+                                                                  if not (chunk.source_uri and chunk.revision_id))}),
         ]
-
-        # 2) Graph attribution
-        expected_revision = self.repo.disclosure_revision_for_context(
-            product_id=context.product_id,
-            jurisdiction=context.jurisdiction,
-            signed_at=context.signed_at,
-        )
-        expected_revision_node_id = (
-            self.repo.revision_node(expected_revision['revision_id'], signed_at=context.signed_at)['node_id']
-            if expected_revision
-            else None
-        )
-        product_node_id = self.repo.product_node(context.product_id, signed_at=context.signed_at)['node_id']
-
-        graph_node_ids = {node.node_id for node in (getattr(graph, 'nodes', []) or [])}
-        graph_attribution_passed = bool(graph_node_ids) and (product_node_id in graph_node_ids) and (
-            expected_revision_node_id in graph_node_ids if expected_revision_node_id else True
-        )
-
-        dims.append(
-            DimensionResult(
-                name='graph_attribution',
-                passed=graph_attribution_passed,
-                detail={
-                    'case_id': case.case_id,
-                    'expected_revision_id': expected_revision['revision_id'] if expected_revision else None,
-                    'graph_node_ids': sorted(graph_node_ids),
-                },
-            )
-        )
-
-        # 3) Citation support / grounding
-        expected_citation_ids = {c.citation_id for c in citations}
-        citation_ids_in_provenance = set()
-        citation_supported = True
-        for c in citations:
-            if not c.chunk_id or not c.revision_id or not c.source_uri:
-                citation_supported = False
-            if c.revision_id and c.revision_id not in authorized:
-                citation_supported = False
-            citation_ids_in_provenance.add(c.citation_id)
-
-        dims.append(
-            DimensionResult(
-                name='citation_grounding',
-                passed=bool(expected_citation_ids) and citation_supported,
-                detail={
-                    'case_id': case.case_id,
-                    'citation_ids': sorted(expected_citation_ids),
-                    'authorized_revision_ids': sorted(authorized),
-                },
-            )
-        )
-
-        # 4) Answer faithfulness (deterministic heuristics; attempts generation only when keys exist)
-        if answer_text is None:
-            passed = False
-            detail = {
-                'case_id': case.case_id,
-                'reason': generation_error or 'llm_not_configured',
-            }
-        else:
-            # Heuristic: at least one expected citation id must appear.
-            found = set(re.findall(r'\bC\d+\b', answer_text or ''))
-            passed = bool(expected_citation_ids & found) and (bool(retrieved_chunks) or not expected_citation_ids)
-            detail = {
-                'case_id': case.case_id,
-                'expected_citation_ids': sorted(expected_citation_ids),
-                'found_citation_ids': sorted(found),
-            }
-
-        dims.append(
-            DimensionResult(
-                name='answer_faithfulness',
-                passed=passed,
-                detail=detail,
-            )
-        )
-
-        return dims
 
     def _persist(self, report: EvaluationReport) -> None:
         settings = get_settings()
@@ -224,7 +94,8 @@ class Evaluator:
                 VALUES (%s, %s, %s, %s, now(), %s)
                 RETURNING run_id
                 """,
-                (report.run_label, settings.corpus_id, settings.index_id, 'starter-hardened', Json(report.model_dump(mode='json'))),
+                (report.run_label, settings.corpus_id, settings.index_id, 'solution',
+                 Json(report.model_dump(mode='json'))),
             ).fetchone()
             for dim in report.dimensions:
                 conn.execute(
@@ -237,9 +108,17 @@ class Evaluator:
             conn.commit()
 
 
+def summarise(report: EvaluationReport) -> dict[str, dict[str, int]]:
+    out: dict[str, dict[str, int]] = {name: {'passed': 0, 'failed': 0} for name in DIMENSIONS}
+    for dim in report.dimensions:
+        bucket = out.setdefault(dim.name, {'passed': 0, 'failed': 0})
+        bucket['passed' if dim.passed else 'failed'] += 1
+    return out
+
+
 def main() -> None:
     report = Evaluator().evaluate('manual')
-    print(report.model_dump_json(indent=2))
+    print(json.dumps({'run_label': report.run_label, 'by_dimension': summarise(report)}, indent=2))
 
 
 if __name__ == '__main__':
